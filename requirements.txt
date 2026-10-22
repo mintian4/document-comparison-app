@@ -1,5 +1,4 @@
 streamlit>=1.40,<2
-openai>=1.50,<3
 python-docx>=1.1,<2
 pypdf>=5,<7
 olefile>=0.47,<1

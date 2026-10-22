@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import difflib
 import html
-import os
 import re
 import struct
 import zipfile
@@ -127,18 +126,74 @@ def render_diff(old_text: str, new_text: str) -> tuple[str, int, int]:
     return style + body, added, deleted
 
 
-def summarize_with_ai(old_text: str, new_text: str) -> str:
-    from openai import OpenAI
+def summarize_changes(old_text: str, new_text: str) -> list[tuple[str, str]]:
+    """Collect changed lines directly from the documents without calling an AI service."""
+    matcher = difflib.SequenceMatcher(a=old_text.splitlines(), b=new_text.splitlines(), autojunk=False)
+    changes = []
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        old_part = "\n".join(old_text.splitlines()[i1:i2]) or "(없음)"
+        new_part = "\n".join(new_text.splitlines()[j1:j2]) or "(없음)"
+        changes.append((old_part, new_part))
+    return changes
 
-    client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
-    model = os.environ.get("OPENAI_MODEL", "gpt-4.1-mini")
-    response = client.responses.create(
-        model=model,
-        instructions="당신은 문서 변경 사항을 요약하는 도우미입니다. 제공된 두 문서의 차이를 한국어로 간결하게 요약하세요. 변경을 추측하거나 규정 준수 여부를 판단하지 말고, 중요한 수치·시간·책임·기록 변경을 구분하세요.",
-        input=f"[이전 문서]\n{old_text}\n\n[수정 문서]\n{new_text}",
-        max_output_tokens=500,
-    )
-    return response.output_text
+
+def _question_terms(question: str) -> list[str]:
+    stop_words = {
+        "어떻게", "뭐", "무엇", "무슨", "어떤", "알려줘", "알려주세요", "바뀌었어", "바뀌었나요",
+        "차이", "변경", "비교", "해줘", "해줘요", "인가요", "인가", "은", "는", "이", "가",
+        "을", "를", "에", "에서", "으로", "와", "과", "좀", "문서", "내용",
+    }
+    terms = []
+    for token in re.findall(r"[가-힣A-Za-z0-9]+", question.lower()):
+        if token in stop_words or len(token) < 2:
+            continue
+        terms.append(token)
+        for particle in ("에서", "으로", "에게", "은", "는", "이", "가", "을", "를", "에", "의", "도", "와", "과", "로"):
+            if token.endswith(particle) and len(token) - len(particle) >= 2:
+                terms.append(token[:-len(particle)])
+                break
+    return list(dict.fromkeys(terms))
+
+
+def _relevant_lines(text: str, terms: list[str], limit: int = 3) -> list[str]:
+    if not terms:
+        return []
+    query = "".join(terms)
+    query_grams = {query[i:i + 2] for i in range(max(0, len(query) - 1))}
+    ranked = []
+    for line in text.splitlines():
+        cleaned = re.sub(r"[^가-힣a-z0-9]", "", line.lower())
+        if len(cleaned) < 2:
+            continue
+        line_grams = {cleaned[i:i + 2] for i in range(len(cleaned) - 1)}
+        overlap = len(query_grams & line_grams) / max(1, len(query_grams))
+        exact = sum(1 for term in terms if re.sub(r"[^가-힣a-z0-9]", "", term) in cleaned)
+        score = overlap + exact * 0.35
+        if score > 0:
+            ranked.append((score, line.strip()))
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    return [line for _, line in ranked[:limit]]
+
+
+def answer_from_documents(question: str, old_text: str, new_text: str) -> str:
+    terms = _question_terms(question)
+    old_hits = _relevant_lines(old_text, terms)
+    new_hits = _relevant_lines(new_text, terms)
+    if not old_hits and not new_hits:
+        return "질문과 관련된 문장을 문서에서 찾지 못했어요. 문서에 쓰인 단어를 포함해 다시 질문해 주세요."
+    answer = []
+    if old_hits:
+        answer.append("**이전 문서에서 찾은 내용**\n" + "\n".join(f"- {line}" for line in old_hits))
+    if new_hits:
+        answer.append("**수정 문서에서 찾은 내용**\n" + "\n".join(f"- {line}" for line in new_hits))
+    if old_hits and new_hits:
+        if old_hits[0] == new_hits[0]:
+            answer.append("두 문서에서 가장 관련 있는 문장은 같습니다.")
+        else:
+            answer.append("두 문서의 관련 문장을 비교해 보세요. 변경 이유는 문서에 적혀 있지 않으면 알 수 없습니다.")
+    return "\n\n".join(answer)
 
 
 with st.sidebar:
@@ -150,7 +205,6 @@ with st.sidebar:
         st.session_state["old_text"] = SAMPLE_OLD
         st.session_state["new_text"] = SAMPLE_NEW
     st.divider()
-    ai_enabled = st.checkbox("AI 변경 요약 사용", help="OPENAI_API_KEY 환경 변수가 설정된 경우에만 작동합니다. 사용하면 두 문서의 텍스트가 OpenAI API로 전송됩니다.")
 
 try:
     old_default = read_upload(old_file) if old_file else st.session_state.get("old_text", SAMPLE_OLD)
@@ -173,8 +227,12 @@ if st.button("문서 비교하기", type="primary", use_container_width=True):
         st.warning("비교할 내용을 입력하거나 파일을 올려 주세요.")
     else:
         diff_html, added, deleted = render_diff(old_text, new_text)
+        st.session_state["chat_messages"] = []
         st.session_state["diff_html"] = diff_html
         st.session_state["counts"] = (added, deleted)
+        st.session_state["change_summary"] = summarize_changes(old_text, new_text)
+        st.session_state["qa_old_text"] = old_text
+        st.session_state["qa_new_text"] = new_text
         st.session_state["compared"] = True
 
 if st.session_state.get("compared"):
@@ -186,18 +244,35 @@ if st.session_state.get("compared"):
     st.html(st.session_state["diff_html"])
     report = f"# 문서 비교 결과\n\n- 추가된 줄: {added}\n- 삭제·변경된 줄: {deleted}\n\n## 이전 문서\n```text\n{old_text}\n```\n\n## 수정 문서\n```text\n{new_text}\n```\n"
     st.download_button("비교 결과 다운로드 (.md)", report, file_name="document_comparison.md", mime="text/markdown")
-    if ai_enabled:
-        if not os.environ.get("OPENAI_API_KEY"):
-            st.info("AI 요약을 쓰려면 실행 전에 OPENAI_API_KEY 환경 변수를 설정하세요. 일반 비교 기능은 API 키 없이 사용할 수 있습니다.")
-        elif st.button("AI로 변경 요약하기"):
-            try:
-                with st.spinner("요약 중…"):
-                    st.session_state["ai_summary"] = summarize_with_ai(old_text, new_text)
-            except Exception as exc:
-                st.error(f"요약에 실패했습니다. API 키와 네트워크를 확인해 주세요. 상세 내용: {exc}")
-        if st.session_state.get("ai_summary"):
-            st.subheader("AI 변경 요약")
-            st.markdown(st.session_state["ai_summary"])
+    st.subheader("자동 변경 요약")
+    changes = st.session_state.get("change_summary", [])
+    if not changes:
+        st.write("두 문서의 줄 단위 차이가 없습니다.")
+    else:
+        for index, (old_part, new_part) in enumerate(changes, start=1):
+            with st.expander(f"변경 {index}", expanded=index == 1):
+                st.markdown("**이전 문서**")
+                st.code(old_part, language=None)
+                st.markdown("**수정 문서**")
+                st.code(new_part, language=None)
+
+    st.subheader("문서에 질문하기")
+    st.caption("문서에서 질문과 관련된 문장을 찾아 이전·수정 내용을 보여줍니다. 생성형 AI API는 사용하지 않습니다.")
+    if "chat_messages" not in st.session_state:
+        st.session_state["chat_messages"] = []
+    for message in st.session_state["chat_messages"]:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+    question = st.chat_input("예: 저장탱크 온도 기준이 어떻게 바뀌었어?")
+    if question:
+        st.session_state["chat_messages"].append({"role": "user", "content": question})
+        answer = answer_from_documents(
+            question,
+            st.session_state.get("qa_old_text", old_text),
+            st.session_state.get("qa_new_text", new_text),
+        )
+        st.session_state["chat_messages"].append({"role": "assistant", "content": answer})
+        st.rerun()
 
 with st.expander("비교 방식과 한계"):
     st.write("파일에서 글자를 추출한 뒤 줄 단위로 비교합니다. 스캔 이미지 PDF는 글자 추출이 되지 않을 수 있고, PDF의 표나 복잡한 배치는 원래 모양과 다르게 추출될 수 있습니다. 구형 HWP의 표, 글상자, 수식 등은 일부 빠지거나 순서가 달라질 수 있습니다. DOCX 표는 텍스트 형태로 읽습니다. 스캔 PDF는 OCR 기능이 필요합니다.")
